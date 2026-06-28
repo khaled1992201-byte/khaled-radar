@@ -1,236 +1,629 @@
-﻿#include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include "driver/pcnt.h"
-
-// --- التوصيلات والمنافذ المعتمدة لجهاز المهندس خالد زكريا ---
-#define PCNT_PIN_B 18         // حساس القريب السفلي B
-#define PCNT_PIN_T 19         // حساس البعيد العلوي T
-#define CALIBRATION_BTN 4     // زر العصا المادي لتسجيل الخطوات ميدانياً
-
-#define SERVICE_UUID        "0000ffe0-0000-1000-8000-00805f9b34fb"
-#define CHARACTERISTIC_UUID "0000ffe1-0000-1000-8000-00805f9b34fb"
-
-enum Mode { LIVE, GRID };
-Mode currentMode = LIVE;
-
-float offsetB = 0.0f;
-float offsetT = 0.0f;
-float freqB_smooth = 0.0f;
-float freqT_smooth = 0.0f;
-float latestDelta = 0.0f;
-
-// فلتر تنعيم مستقر طيفياً (EMA) لعزل تذبذبات واهتزازات اليد الميدانية
-const float alpha = 0.18f; 
-float ironMaskLevel = 0.50f; // مستوى عزل الحديد الافتراضي (50%)
-
-BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
-bool deviceConnected = false;
-volatile bool triggerCaptureFlag = false;
-
-int64_t lastSampleTimeUs = 0;
-const int64_t sampleIntervalUs = 100000; // نافذة أخذ العينات الدقيقة: 100ms بالمايكروثانية
-
-void performMultiSampleCalibration();
-void sendPacketToPhone(float b, float t, float d, String info);
-
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) { 
-      deviceConnected = true; 
-    }
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      BLEDevice::startAdvertising(); // إعادة البث تلقائياً لمنع انقطاع الاتصال
-    }
-};
-
-class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      // قراءة الأمر المباشر بطريقة مرنة لتفادي خطأ std::string في حزم آردوينو الحديثة والقديمة
-      String value = "";
-      #if defined(ARDUINO_ARCH_ESP32) && defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-        value = pCharacteristic->getValue();
-      #else
-        value = String(pCharacteristic->getValue().c_str());
-      #endif
-      
-      if (value.length() > 0) {
-        char cmd = value[0];
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>رادار زكريا الجيولوجي التفاعلي 3D</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #030712; user-select: none; -webkit-user-select: none; }
+        ::-webkit-scrollbar { display: none; }
         
-        if (cmd == 'M') {
-          currentMode = (value[1] == '2') ? GRID : LIVE;
-        } 
-        else if (cmd == 'C') {
-          performMultiSampleCalibration(); // موازنة أرضية دقيقة ومتعددة النقاط
+        .scene-3d {
+            perspective: 1200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px 0;
+            overflow: hidden;
         }
-        else if (cmd == 'S') {
-          triggerCaptureFlag = true; // تسجيل نقطة بطلب رقمي من شاشة الهاتف
+
+        .grid-3d {
+            transform-style: preserve-3d;
+            transform: rotateX(45deg) rotateZ(-30deg);
+            transition: transform 0.5s ease;
         }
-        else if (cmd == 'I') {
-          // استقبال قيمة شريط عزل الحديد وتعديل الحساسية
-          String valStr = value.substring(1);
-          ironMaskLevel = valStr.toInt() / 100.0f;
+
+        .block-3d {
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), background-color 0.3s;
+            aspect-ratio: 1;
+            border-radius: 6px;
+            box-shadow: inset 0 0 12px rgba(255, 255, 255, 0.05);
         }
-      }
-    }
-};
 
-void setup_pcnt_unit(int unit, int pin) {
-    pcnt_config_t cfg = {
-        .pulse_gpio_num = (gpio_num_t)pin,
-        .ctrl_gpio_num = PCNT_PIN_NOT_USED,
-        .lctrl_mode = PCNT_MODE_KEEP,
-        .hctrl_mode = PCNT_MODE_KEEP,
-        .pos_mode = PCNT_COUNT_INC,
-        .neg_mode = PCNT_COUNT_DIS,
-        .counter_h_lim = 32767,
-        .counter_l_lim = -32768,
-        .unit = (pcnt_unit_t)unit,
-        .channel = PCNT_CHANNEL_0,
-    };
-    pcnt_unit_config(&cfg);
-    pcnt_counter_pause((pcnt_unit_t)unit);
-    pcnt_counter_clear((pcnt_unit_t)unit);
-    pcnt_counter_resume((pcnt_unit_t)unit);
-}
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(CALIBRATION_BTN, INPUT_PULLUP);
-
-  // إعداد عدادات النبضات للهاردوير (Hardware PCNT) لعد النبضات في الخلفية بدون تأخير
-  setup_pcnt_unit(PCNT_UNIT_0, PCNT_PIN_B);
-  setup_pcnt_unit(PCNT_UNIT_1, PCNT_PIN_T);
-
-  BLEDevice::init("Gradiometer_Pro_100ms");
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ   |
-                      BLECharacteristic::PROPERTY_WRITE  |
-                      BLECharacteristic::PROPERTY_NOTIFY |
-                      BLECharacteristic::PROPERTY_INDICATE
-                    );
-
-  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-  pCharacteristic->addDescriptor(new BLE2902());
-  pService->start();
-  
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
-  Serial.println("Gradiometer Wireless BLE Core Configured Successfully.");
-}
-
-void loop() {
-  int64_t currentTimeUs = esp_timer_get_time();
-
-  if (currentTimeUs - lastSampleTimeUs >= sampleIntervalUs) {
-    int16_t rawB, rawT;
-    pcnt_get_counter_value(PCNT_UNIT_0, &rawB);
-    pcnt_get_counter_value(PCNT_UNIT_1, &rawT);
-    pcnt_counter_clear(PCNT_UNIT_0);
-    pcnt_counter_clear(PCNT_UNIT_1);
-
-    int64_t elapsedUs = currentTimeUs - lastSampleTimeUs;
-    lastSampleTimeUs = currentTimeUs;
-
-    // حساب التردد الحقيقي بالهرتز بدقة الميكرو ثانية
-    float freqB = (float)rawB * 1000000.0f / (float)elapsedUs;
-    float freqT = (float)rawT * 1000000.0f / (float)elapsedUs;
-
-    // تطبيق فلتر الاستقرار وتنعيم قراءات التربة والاهتزازات الجانبية
-    if (freqB_smooth == 0.0f) {
-      freqB_smooth = freqB;
-      freqT_smooth = freqT;
-    } else {
-      freqB_smooth = (alpha * freqB) + ((1.0f - alpha) * freqB_smooth);
-      freqT_smooth = (alpha * freqT) + ((1.0f - alpha) * freqT_smooth);
-    }
-
-    float diffB = freqB_smooth - offsetB;
-    float diffT = freqT_smooth - offsetT;
-    
-    // حساب الدلتا الفروقية الفيزيائية بإشاراتها (+ للمعادن، - للفراغات)
-    float rawDelta = diffB - diffT;
-
-    // خوارزمية عزل الحديد والتمعدن السطحي (Iron Masking) المحددة من الهاتف
-    if (abs(rawDelta) > (250.0f * (1.0f - ironMaskLevel))) {
-        rawDelta = 0.0f; // عزل فوري للإشارات والنبضات الحديدية العنيفة
-    }
-
-    latestDelta = rawDelta;
-
-    if (currentMode == LIVE && deviceConnected) {
-      sendPacketToPhone(diffB, diffT, latestDelta, "Live");
-    }
-  }
-
-  if (currentMode == GRID) {
-    // التقاط قراءة زر العصا المادي
-    if (digitalRead(CALIBRATION_BTN) == LOW) {
-      delay(50); 
-      if (digitalRead(CALIBRATION_BTN) == LOW) {
-        if (deviceConnected) {
-          float diffB = freqB_smooth - offsetB;
-          float diffT = freqT_smooth - offsetT;
-          sendPacketToPhone(diffB, diffT, latestDelta, "Captured");
+        .block-top {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: rgba(30, 41, 59, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transform: translateZ(var(--height, 0px));
+            transition: transform 0.3s, background-color 0.3s;
+            color: #fff;
+            font-weight: 900;
         }
-        while (digitalRead(CALIBRATION_BTN) == LOW) { delay(10); }
-        delay(100); 
-      }
-    }
 
-    // التقاط قراءة زر الشاشة التفاعلي بالآيفون
-    if (triggerCaptureFlag) {
-      triggerCaptureFlag = false;
-      if (deviceConnected) {
-        float diffB = freqB_smooth - offsetB;
-        float diffT = freqT_smooth - offsetT;
-        sendPacketToPhone(diffB, diffT, latestDelta, "Captured");
-      }
-    }
-  }
-}
+        .compass-dial {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            border: 3px solid #f59e0b;
+            position: relative;
+            background: #0f172a;
+            box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
+            transition: transform 0.1s ease-out;
+        }
+    </style>
+</head>
+<body class="text-slate-100 font-sans min-h-screen pb-12">
 
-void sendPacketToPhone(float b, float t, float d, String info) {
-  if (deviceConnected && pCharacteristic != NULL) {
-    char txBuffer[90];
-    sprintf(txBuffer, "B:%.1f|T:%.1f|Delta:%.1f|Info:%s\n", b, t, d, info.c_str());
-    pCharacteristic->setValue(txBuffer);
-    pCharacteristic->notify();
-  }
-}
+    <header class="bg-slate-900/95 border-b border-slate-800 p-4 sticky top-0 z-50 flex justify-between items-center">
+        <div>
+            <h1 class="text-lg font-black text-amber-500">نظام تحليل الأهداف والتمييز المطور</h1>
+            <p class="text-[10px] text-slate-400">إصدار التمييز الجيولوجي الحقيقي - المهندس خالد زكريا 🛰️</p>
+        </div>
+        <div class="text-left">
+            <span id="connectionStateText" class="text-xs text-red-400 font-bold">غير متصل</span>
+        </div>
+    </header>
 
-// تصفير ومعايرة طيفية تأخذ متوسط 25 قراءة متتالية لضمان استقرار خط موازنة الأرض في الحقل
-void performMultiSampleCalibration() {
-  float sumB = 0;
-  float sumT = 0;
-  int samples = 25;
-  
-  for (int i = 0; i < samples; i++) {
-    int16_t rawB, rawT;
-    pcnt_get_counter_value(PCNT_UNIT_0, &rawB);
-    pcnt_get_counter_value(PCNT_UNIT_1, &rawT);
-    pcnt_counter_clear(PCNT_UNIT_0);
-    pcnt_counter_clear(PCNT_UNIT_1);
-    
-    sumB += (float)rawB * 10.0f;
-    sumT += (float)rawT * 10.0f;
-    delay(40); 
-  }
-  
-  offsetB = sumB / (float)samples;
-  offsetT = sumT / (float)samples;
-  
-  freqB_smooth = offsetB;
-  freqT_smooth = offsetT;
-  latestDelta = 0.0f;
-}
+    <!-- نظام بطاقة الإشعارات التفاعلية البديل عن Alert لمنع تعليق البلوتوث -->
+    <div id="toastNotification" class="hidden fixed bottom-6 left-6 right-6 md:left-auto md:w-80 bg-slate-950 border border-amber-500/50 text-white px-4 py-3 rounded-xl shadow-2xl transition-all duration-300 flex items-center gap-3 z-50">
+        <span id="toastIcon">⚠️</span>
+        <span id="toastText" class="text-xs font-bold leading-relaxed">تنبيه</span>
+    </div>
+
+    <main class="max-w-md mx-auto p-4 space-y-4">
+
+        <div class="grid grid-cols-2 gap-3">
+            <button onclick="connectBluetooth()" class="bg-amber-500 text-slate-950 font-black py-3 rounded-xl text-xs active:scale-95 transition">📡 ربط بلوتوث (Bluefy)</button>
+            <button onclick="toggleSimulation()" id="btnSim" class="bg-slate-900 border border-slate-800 text-slate-300 font-bold py-3 rounded-xl text-xs active:scale-95 transition">🤖 تشغيل المحاكاة</button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 bg-slate-900 p-1.5 rounded-xl border border-slate-800">
+            <button id="mLive" onclick="changeMode('LIVE')" class="py-2.5 px-2 rounded-lg font-black text-xs bg-amber-500 text-slate-950">🔍 مسح مباشر حُر</button>
+            <button id="mGrid" onclick="changeMode('GRID')" class="py-2.5 px-2 rounded-lg font-bold text-xs text-slate-400">🗺️ تصوير شبكي (GRID)</button>
+        </div>
+
+        <!-- لوحة مستشعرات البوصلة المدمجة الحركية للآيفون -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 flex items-center justify-between gap-4">
+            <div class="space-y-1.5 flex-1">
+                <h3 class="text-xs font-black text-amber-500">البوصلة المغناطيسية للآيفون 🧭</h3>
+                <p class="text-[9px] text-slate-400 leading-relaxed">حدد اتجاه الشمال لتجنب تداخل خطوط حقل الأرض واكتشاف الأهداف الوهمية بدقة.</p>
+                <button onclick="requestCompassPermission()" class="bg-slate-950 border border-amber-500/20 text-[10px] text-amber-400 font-bold px-3 py-1.5 rounded-lg active:scale-95 transition">🔄 ربط مستشعرات الآيفون</button>
+            </div>
+            
+            <div class="flex flex-col items-center gap-1.5">
+                <div class="compass-dial flex items-center justify-center" id="compassRing">
+                    <span class="absolute top-1 text-[10px] font-black text-red-500">N</span>
+                    <span class="absolute bottom-1 text-[10px] font-bold text-slate-400">S</span>
+                    <span class="absolute right-1.5 text-[10px] font-bold text-slate-400">E</span>
+                    <span class="absolute left-1.5 text-[10px] font-bold text-slate-400">W</span>
+                    <div class="w-1 h-12 bg-gradient-to-b from-red-500 to-amber-500 rounded-full" style="transform: translateY(-4px);"></div>
+                </div>
+                <span id="compassHeadingText" class="text-[10px] font-black font-mono text-amber-500">000° N</span>
+            </div>
+        </div>
+
+        <!-- لوحة التحكم في نوع التربة وحجم الشبكة والفلتر -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 space-y-3">
+            <div class="grid grid-cols-2 gap-2">
+                <div>
+                    <label class="text-[10px] text-slate-400 block mb-1">نوع التربة الميدانية</label>
+                    <select id="soilType" onchange="adjustSoilFilter()" class="w-full bg-slate-950 border border-slate-800 text-xs p-2.5 rounded-lg text-amber-500 focus:outline-none">
+                        <option value="1.0" data-factor="1.8" data-damping="1.0">تربة رملية جافة (نفاذية عالية)</option>
+                        <option value="1.2" data-factor="1.2" data-damping="1.3">تربة صخرية (مقاومة متوسطة)</option>
+                        <option value="1.5" data-factor="0.7" data-damping="1.8">تربة بركانية (مقاومة عالية)</option>
+                        <option value="1.8" data-factor="0.4" data-damping="2.2">تربة معدنية ساخنة (تلاشي حاد)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="text-[10px] text-slate-400 block mb-1">حجم الشبكة المطلوبة</label>
+                    <select id="gridSizeSel" onchange="initGridData()" class="w-full bg-slate-950 border border-slate-800 text-xs p-2.5 rounded-lg text-amber-500 focus:outline-none">
+                        <option value="5" selected>شبكة 5 × 5 ⭐</option>
+                        <option value="8">شبكة 8 × 8</option>
+                        <option value="12">شبكة 12 × 12</option>
+                        <option value="16">شبكة 16 × 16</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- شريط عزل الحديد المباشر -->
+            <div class="pt-2 border-t border-slate-800/50 space-y-2">
+                <div class="flex justify-between text-xs mb-1">
+                    <span class="text-slate-400 text-[11px]">مستوى عزل وتصفية الحديد (Iron Masking)</span>
+                    <span id="ironMaskText" class="text-amber-500 font-mono font-bold">50%</span>
+                </div>
+                <input type="range" id="ironSlider" min="0" max="100" value="50" oninput="sendMask(this.value)" class="w-full accent-amber-500 bg-slate-800 h-1 rounded-lg appearance-none">
+            </div>
+
+            <!-- محدد فلترة جودة المسح وتصفية الوهمي -->
+            <div class="pt-2 border-t border-slate-800/50 space-y-2">
+                <div class="flex justify-between text-xs items-center">
+                    <span class="text-slate-400 text-[11px]">نظام تتبع ومعايرة التربة الميدانية (AGT)</span>
+                    <span class="text-emerald-500 font-bold text-[10px]">مُنشط برمجياً بالكامل 🛡️</span>
+                </div>
+                
+                <div class="flex justify-between text-xs mb-1">
+                    <span class="text-slate-400 text-[11px]">درجة فلترة التنعيم الموقعي (Smooth)</span>
+                    <span id="smoothVal" class="text-amber-500 font-mono font-bold">إيقاف</span>
+                </div>
+                <input type="range" id="filterRange" min="0" max="3" value="0" step="1" oninput="updateFilter(this.value)" class="w-full accent-amber-500 bg-slate-800 h-1 rounded-lg appearance-none">
+            </div>
+        </div>
+
+        <!-- لوحة شاشة العرض الرقمية لقيمة ديلتا المباشرة والمعدن المكتشف والعمق الحقيقي المباشر -->
+        <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4 text-center relative overflow-hidden">
+            <span class="text-[9px] text-slate-500 tracking-widest font-bold">المؤشر الرقمي وتحليل نوع الهدف والعمق</span>
+            
+            <div id="txtDelta" class="text-5xl font-black text-amber-500 my-1 font-mono">0.0</div>
+            <div id="targetTypeLabel" class="text-xs font-bold text-slate-400 tracking-wider">بانتظار الإشارة...</div>
+            <div id="liveDepthLabel" class="text-sm font-black text-cyan-400 mt-1 font-mono">العمق: 0.00m</div>
+
+            <div class="w-full h-1.5 bg-slate-900 rounded-full overflow-hidden mt-2">
+                <div id="barDelta" class="w-0 h-full bg-amber-500 transition-all duration-75"></div>
+            </div>
+        </div>
+
+        <!-- شاشة شبكة المربعات ثلاثية الأبعاد (GRID VIEW) -->
+        <div id="panel3D" class="hidden bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
+            
+            <button onclick="triggerManualCapture()" class="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-black py-4 rounded-2xl text-base active:scale-95 transition shadow-lg shadow-emerald-500/20 flex justify-center items-center gap-2">
+                🎯 تسجيل وقراءة النقطة الحالية (Capture)
+            </button>
+
+            <div class="flex justify-between items-center text-xs pt-1">
+                <span class="text-amber-500 font-bold">مصفوفة الأعمدة وتحليل التربة (3D Blocks)</span>
+                <span id="txtCoords" class="font-mono bg-amber-500/10 text-amber-400 px-2.5 py-1 rounded-lg border border-amber-500/20">X:1 , Y:1</span>
+            </div>
+
+            <!-- لوحة دوارة للتحكم برؤية المنظور ثلاثي الأبعاد -->
+            <div class="flex justify-center gap-4 text-[10px] text-slate-400">
+                <button onclick="rotateGrid(-15)" class="bg-slate-950 px-2 py-1 rounded border border-slate-800">◀ تدوير يسار</button>
+                <button onclick="resetRotation()" class="bg-slate-950 px-2 py-1 rounded border border-slate-800">🔄 إعادة ضبط</button>
+                <button onclick="rotateGrid(15)" class="bg-slate-950 px-2 py-1 rounded border border-slate-800">تدوير يمين ▶</button>
+            </div>
+            
+            <div class="scene-3d bg-slate-950/80 rounded-2xl p-4 border border-slate-950">
+                <div id="visualGridContainer" class="grid-3d grid gap-2 w-full max-w-[280px]"></div>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-2 pt-2">
+                <button onclick="saveGridToFile()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 rounded-xl text-xs transition active:scale-95">💾 حفظ ملف المسح (TXT)</button>
+                <button onclick="resetGridData()" class="bg-red-500/10 text-red-400 border border-red-500/20 font-bold py-2.5 rounded-xl text-xs transition active:scale-95">🧹 مسح الذاكرة</button>
+            </div>
+        </div>
+
+        <!-- مخطط الرسم الخطي للمسح المباشر -->
+        <div id="panelLive" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
+            <div class="flex justify-between items-center">
+                <span class="text-[10px] text-slate-400 font-bold">مخطط الرصد الترددي المستمر</span>
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] text-slate-400">صوت المسح اللحظي:</span>
+                    <button id="btnAudioToggle" onclick="toggleAudioMute()" class="bg-red-600 text-[10px] font-bold px-2 py-0.5 rounded text-white">إيقاف 🔇</button>
+                </div>
+            </div>
+            <div class="w-full h-28 bg-slate-950 rounded-xl overflow-hidden border border-slate-950">
+                <canvas id="chartLive" class="w-full h-full"></canvas>
+            </div>
+        </div>
+
+        <button onclick="triggerCalibration()" class="w-full bg-blue-600 text-white font-black py-4 rounded-2xl text-sm active:scale-95 transition shadow-lg shadow-blue-500/15">⚖️ موازنة وتصفير حقل التربة (Calibration)</button>
+
+    </main>
+
+    <footer class="text-center py-6 text-[10px] text-slate-500">
+        جميع الحقوق محفوظة &copy; المهندس خالد زكريا 2026
+    </footer>
+
+    <script>
+        let device = null, rxChar = null;
+        let currentSystemMode = 'LIVE';
+        let isSimulate = false, simInt = null;
+        let liveData = Array(30).fill(0);
+        let soilMultiplier = 1.0;
+        let soilDepthFactor = 1.8;
+        let soilDampingFactor = 1.0;
+
+        let size = 5;
+        let matrix = [];
+        let curX = 0, curY = 0;
+        let currentLiveDelta = 0.0;
+
+        let audioCtx = null, osc = null, gainNode = null;
+        let isAudioPlaying = false;
+        let isAudioMuted = true;
+
+        let currentRotationZ = -30;
+        let compassHeading = 0;
+
+        // 🌟 المحرك اللاسلكي لمعالجة تجزئة حزم البيانات (BLE Stream Buffer Engine) 🌟
+        let bleBuffer = ""; 
+
+        window.onload = function() {
+            initGridData();
+            resizeCanvas();
+            window.onresize = resizeCanvas;
+        };
+
+        function resizeCanvas() {
+            const c = document.getElementById('chartLive');
+            c.width = c.parentElement.clientWidth;
+            c.height = c.parentElement.clientHeight;
+            drawChart();
+        }
+
+        // إشعار ذكي مخصص لمنع تعليق البلوتوث
+        function showNotification(text, icon = "⚠️") {
+            const toast = document.getElementById('toastNotification');
+            document.getElementById('toastText').innerText = text;
+            document.getElementById('toastIcon').innerText = icon;
+            toast.classList.remove('hidden');
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 4000);
+        }
+
+        function sendMask(val) {
+            document.getElementById('ironMaskText').innerText = val + "%";
+            if (rxChar) {
+                rxChar.writeValue(new TextEncoder().encode('I' + val));
+            }
+        }
+
+        // دالة موحدة فائقة الأمان لفك تشفير حزم البلوتوث على الآيفون والأنظمة المختلفة
+        function decodeBLEValue(value) {
+            if (!value) return "";
+            if (value.buffer) {
+                return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+            }
+            if (value instanceof ArrayBuffer) {
+                return new TextDecoder().decode(new Uint8Array(value));
+            }
+            if (ArrayBuffer.isView(value)) {
+                return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+            }
+            try {
+                return new TextDecoder().decode(value);
+            } catch(e) {
+                return "";
+            }
+        }
+
+        async function connectBluetooth() {
+            try {
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'Gradiometer' }],
+                    optionalServices: ['0000ffe0-0000-1000-8000-00805f9b34fb']
+                });
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService('0000ffe0-0000-1000-8000-00805f9b34fb');
+                rxChar = await service.getCharacteristic('0000ffe1-0000-1000-8000-00805f9b34fb');
+                
+                await rxChar.startNotifications();
+                
+                // 🌟 نظام تجميع تدفق البث المتطور لتخطي تجزئة حزم الـ MTU 🌟
+                rxChar.addEventListener('characteristicvaluechanged', (e) => {
+                    let decodedStr = decodeBLEValue(e.target.value);
+                    bleBuffer += decodedStr;
+                    
+                    let newlinePos;
+                    while ((newlinePos = bleBuffer.indexOf('\n')) >= 0) {
+                        let completeLine = bleBuffer.substring(0, newlinePos).trim();
+                        bleBuffer = bleBuffer.substring(newlinePos + 1);
+                        if (completeLine.length > 0) {
+                            parseDataPacket(completeLine);
+                        }
+                    }
+                });
+                
+                document.getElementById('connectionStateText').innerText = "متصل بالرادار";
+                document.getElementById('connectionStateText').className = "text-xs text-emerald-400 font-bold";
+                showNotification("تم الاتصال بالرادار بنجاح!", "📡");
+                initAudio();
+            } catch(e) { 
+                showNotification("فشل الاتصال بالبلوتوث الميداني.", "❌"); 
+            }
+        }
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        function mapValueToColor(val) {
+            if (val < -1.5) {
+                const absVal = Math.abs(val);
+                return `rgba(29, 78, 216, ${Math.min(0.4 + (absVal / 20.0), 0.95)})`;
+            } else if (val >= 1.5 && val < 15.0) {
+                return `rgba(245, 158, 11, ${Math.min(0.5 + (val / 15.0), 0.95)})`;
+            } else if (val >= 15.0) {
+                return `rgba(239, 68, 68, ${Math.min(0.5 + (val / 80.0), 0.95)})`;
+            }
+            return "rgba(30, 41, 59, 0.9)";
+        }
+
+        function analyzeTargetType(val) {
+            const absVal = Math.abs(val);
+            if (absVal < 1.5) {
+                return {
+                    name: "تربة متوازنة",
+                    color: "rgba(15, 23, 42, 0.85)",
+                    textColor: "text-slate-400",
+                    soundType: "mute"
+                };
+            }
+            if (val < -1.5) {
+                return {
+                    name: "فراغ / سرداب",
+                    color: mapValueToColor(val),
+                    textColor: "text-blue-300",
+                    soundType: "void"
+                };
+            } else {
+                if (val >= 1.5 && val < 15.0) {
+                    return {
+                        name: "معدن ثمين / ذهب",
+                        color: mapValueToColor(val),
+                        textColor: "text-amber-400",
+                        soundType: "gold"
+                    };
+                } else {
+                    return {
+                        name: "معدن حديدي",
+                        color: mapValueToColor(val),
+                        textColor: "text-red-400",
+                        soundType: "ferrous"
+                    };
+                }
+            }
+        }
+
+        function parseDataPacket(p) {
+            // استخدام التعبيرات النمطية (Regex) بدلاً من الـ Split التقليدي لتجنب تلف النصوص والتقطع
+            let bMatch = p.match(/B:\s*([-\d.]+)/);
+            let tMatch = p.match(/T:\s*([-\d.]+)/);
+            let dMatch = p.match(/Delta:\s*([-\d.]+)/);
+            let infoMatch = p.match(/Info:\s*([^\s|]+)/);
+            
+            if (!bMatch || !tMatch || !dMatch) {
+                return; // حزمة غير مطابقة أو مجزأة بالكامل (يتم انتظار الحزمة التالية)
+            }
+
+            let b = parseFloat(bMatch[1]);
+            let t = parseFloat(tMatch[1]);
+            let d = parseFloat(dMatch[1]);
+            let info = infoMatch ? infoMatch[1] : "Live";
+
+            d = d * soilMultiplier;
+            currentLiveDelta = d;
+
+            const analysis = analyzeTargetType(d);
+            const liveDepth = calculateRealDepth(d);
+
+            document.getElementById('txtDelta').innerText = d.toFixed(1);
+            document.getElementById('targetTypeLabel').innerText = analysis.name;
+            document.getElementById('targetTypeLabel').className = `text-xs font-bold ${analysis.textColor} tracking-wider`;
+            document.getElementById('liveDepthLabel').innerText = `العمق المقدر: ${liveDepth}m`;
+
+            document.getElementById('barDelta').style.width = Math.min((Math.abs(d)/100)*100, 100) + '%';
+
+            if(currentSystemMode === 'LIVE') {
+                updateLiveTone(d, analysis.soundType);
+                liveData.push(d);
+                liveData.shift();
+                drawChart();
+            } else if(currentSystemMode === 'GRID' && info === "Captured") {
+                initAudio();
+                playStepBeep();
+                recordStep(d);
+            }
+        }
+
+        function triggerManualCapture() {
+            if (rxChar) {
+                rxChar.writeValue(new TextEncoder().encode('S'));
+            } else {
+                initAudio();
+                playStepBeep();
+                recordStep(currentLiveDelta);
+            }
+        }
+
+        function recordStep(val) {
+            matrix[curY][curX] = val;
+            curX++;
+            if(curX >= size) {
+                curX = 0; curY++;
+                if(curY >= size) { 
+                    curY = 0; 
+                    showNotification("تم مسح كافة إحداثيات الشبكة بنجاح!", "🏆");
+                }
+            }
+            document.getElementById('txtCoords').innerText = `X:${curX+1} , Y:${curY+1}`;
+            drawGridUI();
+        }
+
+        function startContinuousAudio() {
+            initAudio();
+            if (isAudioPlaying || !audioCtx || isAudioMuted) return;
+            try {
+                osc = audioCtx.createOscillator();
+                gainNode = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(260, audioCtx.currentTime);
+                gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime);
+                osc.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                osc.start();
+                isAudioPlaying = true;
+            } catch(e) {}
+        }
+
+        function stopContinuousAudio() {
+            if (osc) {
+                try { osc.stop(); osc.disconnect(); } catch(e) {}
+                osc = null;
+            }
+            isAudioPlaying = false;
+        }
+
+        function updateLiveTone(delta, soundType) {
+            if (!isAudioPlaying || !gainNode || !osc || isAudioMuted) return;
+            const absDelta = Math.abs(delta);
+
+            if (absDelta > 0.5) {
+                let targetFreq = 260;
+                let targetVolume = Math.min(0.05 + (absDelta * 0.025), 0.35);
+
+                if (soundType === "gold") {
+                    osc.type = 'sine';
+                    targetFreq = 380 + (absDelta * 12.5);
+                } else if (soundType === "ferrous") {
+                    osc.type = 'sawtooth';
+                    targetFreq = 180 + (absDelta * 4.0);
+                    targetVolume = Math.min(0.02 + (absDelta * 0.01), 0.15); 
+                } else if (soundType === "void") {
+                    osc.type = 'triangle';
+                    targetFreq = 220 - (absDelta * 3.5);
+                    if (targetFreq < 60) targetFreq = 60;
+                }
+
+                osc.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.04);
+                gainNode.gain.setTargetAtTime(targetVolume, audioCtx.currentTime, 0.04);
+            } else {
+                gainNode.gain.setTargetAtTime(0.0, audioCtx.currentTime, 0.06);
+            }
+        }
+
+        function playStepBeep() {
+            if (!audioCtx) return;
+            try {
+                let tempOsc = audioCtx.createOscillator();
+                let tempGain = audioCtx.createGain();
+                tempOsc.type = 'sine';
+                tempOsc.frequency.setValueAtTime(1400, audioCtx.currentTime);
+                tempGain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                tempGain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.07);
+                tempOsc.connect(tempGain);
+                tempGain.connect(audioCtx.destination);
+                tempOsc.start(); 
+                tempOsc.stop(audioCtx.currentTime + 0.08);
+            } catch (e) {}
+        }
+
+        function playCalibBeep() {
+            if (!audioCtx) return;
+            try {
+                let tempOsc = audioCtx.createOscillator();
+                let tempGain = audioCtx.createGain();
+                tempOsc.frequency.setValueAtTime(750, audioCtx.currentTime);
+                tempGain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+                tempGain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+                tempOsc.connect(tempGain);
+                tempGain.connect(audioCtx.destination);
+                tempOsc.start(); tempOsc.stop(audioCtx.currentTime + 0.15);
+            } catch(e) {}
+        }
+
+        function saveGridToFile() {
+            let dataLog = `--- رادار زكريا الجيولوجي - تقرير المسح والتمييز بين المعادن والأعماق ---\n`;
+            dataLog += `المهندس المسؤول: المهندس خالد زكريا\n`;
+            dataLog += `تاريخ ووقت المسح: ${new Date().toLocaleString()}\n`;
+            dataLog += `نوع الشبكة المعتمدة: ${size}x${size}\n`;
+            dataLog += `معامل التربة الميدانية: ${soilMultiplier}\n\n`;
+            dataLog += `جدول توزيع البيانات والقيم المغناطيسية المسجلة (بالهرتز HZ):\n`;
+            dataLog += `==============================================\n`;
+            
+            for(let y = 0; y < size; y++) {
+                dataLog += matrix[y].map(v => v.toFixed(2)).join('\t') + '\n';
+            }
+            
+            dataLog += `==============================================\n`;
+            dataLog += `جميع الحقوق محفوظة لصالح المهندس خالد زكريا 2026.\n`;
+
+            const blob = new Blob([dataLog], { type: 'text/plain;charset=utf-8' });
+            const tempLink = document.createElement('a');
+            tempLink.href = URL.createObjectURL(blob);
+            tempLink.download = `Khaled_Radar_Scan_${Date.now()}.txt`;
+            tempLink.click();
+        }
+
+        function resetGridData() {
+            initGridData();
+            showNotification("تم تصفير خريطة المسح بالكامل.", "🧹");
+        }
+
+        document.getElementById('gridSizeSel').value = size;
+
+        function drawChart() {
+            const ctx = document.getElementById('chartLive').getContext('2d');
+            const w = ctx.canvas.width, h = ctx.canvas.height;
+            ctx.clearRect(0,0,w,h);
+            ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 3.5;
+            ctx.beginPath();
+            let step = w / (liveData.length - 1), posX = 0;
+            for(let i=0; i<liveData.length; i++) {
+                // تعديل المقياس التلقائي ديناميكياً لضمان عدم خروج الإشارة عن حدود الشاشة
+                let posY = h - (Math.min(Math.abs(liveData[i]), 500) / 500) * (h - 10) - 5;
+                if(i===0) ctx.moveTo(posX, posY); else ctx.lineTo(posX, posY);
+                posX += step;
+            }
+            ctx.stroke();
+        }
+
+        function triggerCalibration() {
+            if(rxChar) rxChar.writeValue(new TextEncoder().encode('C'));
+            initAudio();
+            playCalibBeep();
+            const d = document.getElementById('txtDelta');
+            d.className = "text-5xl font-black text-sky-400 my-1 font-mono";
+            setTimeout(() => { d.className = "text-5xl font-black text-amber-500 my-1 font-mono"; }, 350);
+            showNotification("جاري تصفير الحقل المغناطيسي للتربة...", "⚖️");
+        }
+
+        function toggleSimulation() {
+            const b = document.getElementById('btnSim');
+            if(isSimulate) {
+                clearInterval(simInt); isSimulate = false;
+                b.className = "bg-slate-900 border border-slate-800 text-slate-300 font-bold py-3 rounded-xl text-xs active:scale-95 transition";
+                document.getElementById('connectionStateText').innerText = "غير متصل";
+                document.getElementById('connectionStateText').className = "text-xs text-red-400 font-bold";
+                stopContinuousAudio();
+                showNotification("تم إيقاف وضع محاكاة التربة.", "🤖");
+            } else {
+                isSimulate = true;
+                b.className = "bg-amber-500/10 border border-amber-500/30 text-amber-400 font-bold py-3 rounded-xl text-xs active:scale-95 transition";
+                document.getElementById('connectionStateText').innerText = "وضع المحاكاة نشط";
+                document.getElementById('connectionStateText').className = "text-xs text-amber-400 font-bold";
+                initAudio();
+                showNotification("بدء محاكاة الأهداف الجيوفيزيائية...", "🤖");
+                
+                if (currentSystemMode === 'LIVE' && !isAudioMuted) startContinuousAudio();
+
+                simInt = setInterval(() => {
+                    const r = Math.random();
+                    let noise = 0.0;
+                    if (r < 0.3) {
+                        noise = -(Math.random() * 20.0);
+                    } else if (r < 0.7) {
+                        noise = Math.random() * 12.0;
+                    } else {
+                        noise = Math.random() * 80.0;
+                    }
+                    const dummyPacket = `B:1500.2|T:1510.5|Delta:${noise.toFixed(2)}|Info:${(currentSystemMode==='GRID'&&Math.random()>0.91)?'Captured':'Live'}\n`;
+                    parseDataPacket(dummyPacket);
+                }, 100);
+            }
+        }
+    </script>
+</body>
+</html>
