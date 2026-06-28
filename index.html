@@ -1,0 +1,236 @@
+﻿#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include "driver/pcnt.h"
+
+// --- التوصيلات والمنافذ المعتمدة لجهاز المهندس خالد زكريا ---
+#define PCNT_PIN_B 18         // حساس القريب السفلي B
+#define PCNT_PIN_T 19         // حساس البعيد العلوي T
+#define CALIBRATION_BTN 4     // زر العصا المادي لتسجيل الخطوات ميدانياً
+
+#define SERVICE_UUID        "0000ffe0-0000-1000-8000-00805f9b34fb"
+#define CHARACTERISTIC_UUID "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+enum Mode { LIVE, GRID };
+Mode currentMode = LIVE;
+
+float offsetB = 0.0f;
+float offsetT = 0.0f;
+float freqB_smooth = 0.0f;
+float freqT_smooth = 0.0f;
+float latestDelta = 0.0f;
+
+// فلتر تنعيم مستقر طيفياً (EMA) لعزل تذبذبات واهتزازات اليد الميدانية
+const float alpha = 0.18f; 
+float ironMaskLevel = 0.50f; // مستوى عزل الحديد الافتراضي (50%)
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+volatile bool triggerCaptureFlag = false;
+
+int64_t lastSampleTimeUs = 0;
+const int64_t sampleIntervalUs = 100000; // نافذة أخذ العينات الدقيقة: 100ms بالمايكروثانية
+
+void performMultiSampleCalibration();
+void sendPacketToPhone(float b, float t, float d, String info);
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) { 
+      deviceConnected = true; 
+    }
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      BLEDevice::startAdvertising(); // إعادة البث تلقائياً لمنع انقطاع الاتصال
+    }
+};
+
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      // قراءة الأمر المباشر بطريقة مرنة لتفادي خطأ std::string في حزم آردوينو الحديثة والقديمة
+      String value = "";
+      #if defined(ARDUINO_ARCH_ESP32) && defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+        value = pCharacteristic->getValue();
+      #else
+        value = String(pCharacteristic->getValue().c_str());
+      #endif
+      
+      if (value.length() > 0) {
+        char cmd = value[0];
+        
+        if (cmd == 'M') {
+          currentMode = (value[1] == '2') ? GRID : LIVE;
+        } 
+        else if (cmd == 'C') {
+          performMultiSampleCalibration(); // موازنة أرضية دقيقة ومتعددة النقاط
+        }
+        else if (cmd == 'S') {
+          triggerCaptureFlag = true; // تسجيل نقطة بطلب رقمي من شاشة الهاتف
+        }
+        else if (cmd == 'I') {
+          // استقبال قيمة شريط عزل الحديد وتعديل الحساسية
+          String valStr = value.substring(1);
+          ironMaskLevel = valStr.toInt() / 100.0f;
+        }
+      }
+    }
+};
+
+void setup_pcnt_unit(int unit, int pin) {
+    pcnt_config_t cfg = {
+        .pulse_gpio_num = (gpio_num_t)pin,
+        .ctrl_gpio_num = PCNT_PIN_NOT_USED,
+        .lctrl_mode = PCNT_MODE_KEEP,
+        .hctrl_mode = PCNT_MODE_KEEP,
+        .pos_mode = PCNT_COUNT_INC,
+        .neg_mode = PCNT_COUNT_DIS,
+        .counter_h_lim = 32767,
+        .counter_l_lim = -32768,
+        .unit = (pcnt_unit_t)unit,
+        .channel = PCNT_CHANNEL_0,
+    };
+    pcnt_unit_config(&cfg);
+    pcnt_counter_pause((pcnt_unit_t)unit);
+    pcnt_counter_clear((pcnt_unit_t)unit);
+    pcnt_counter_resume((pcnt_unit_t)unit);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(CALIBRATION_BTN, INPUT_PULLUP);
+
+  // إعداد عدادات النبضات للهاردوير (Hardware PCNT) لعد النبضات في الخلفية بدون تأخير
+  setup_pcnt_unit(PCNT_UNIT_0, PCNT_PIN_B);
+  setup_pcnt_unit(PCNT_UNIT_1, PCNT_PIN_T);
+
+  BLEDevice::init("Gradiometer_Pro_100ms");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_WRITE  |
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_INDICATE
+                    );
+
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("Gradiometer Wireless BLE Core Configured Successfully.");
+}
+
+void loop() {
+  int64_t currentTimeUs = esp_timer_get_time();
+
+  if (currentTimeUs - lastSampleTimeUs >= sampleIntervalUs) {
+    int16_t rawB, rawT;
+    pcnt_get_counter_value(PCNT_UNIT_0, &rawB);
+    pcnt_get_counter_value(PCNT_UNIT_1, &rawT);
+    pcnt_counter_clear(PCNT_UNIT_0);
+    pcnt_counter_clear(PCNT_UNIT_1);
+
+    int64_t elapsedUs = currentTimeUs - lastSampleTimeUs;
+    lastSampleTimeUs = currentTimeUs;
+
+    // حساب التردد الحقيقي بالهرتز بدقة الميكرو ثانية
+    float freqB = (float)rawB * 1000000.0f / (float)elapsedUs;
+    float freqT = (float)rawT * 1000000.0f / (float)elapsedUs;
+
+    // تطبيق فلتر الاستقرار وتنعيم قراءات التربة والاهتزازات الجانبية
+    if (freqB_smooth == 0.0f) {
+      freqB_smooth = freqB;
+      freqT_smooth = freqT;
+    } else {
+      freqB_smooth = (alpha * freqB) + ((1.0f - alpha) * freqB_smooth);
+      freqT_smooth = (alpha * freqT) + ((1.0f - alpha) * freqT_smooth);
+    }
+
+    float diffB = freqB_smooth - offsetB;
+    float diffT = freqT_smooth - offsetT;
+    
+    // حساب الدلتا الفروقية الفيزيائية بإشاراتها (+ للمعادن، - للفراغات)
+    float rawDelta = diffB - diffT;
+
+    // خوارزمية عزل الحديد والتمعدن السطحي (Iron Masking) المحددة من الهاتف
+    if (abs(rawDelta) > (250.0f * (1.0f - ironMaskLevel))) {
+        rawDelta = 0.0f; // عزل فوري للإشارات والنبضات الحديدية العنيفة
+    }
+
+    latestDelta = rawDelta;
+
+    if (currentMode == LIVE && deviceConnected) {
+      sendPacketToPhone(diffB, diffT, latestDelta, "Live");
+    }
+  }
+
+  if (currentMode == GRID) {
+    // التقاط قراءة زر العصا المادي
+    if (digitalRead(CALIBRATION_BTN) == LOW) {
+      delay(50); 
+      if (digitalRead(CALIBRATION_BTN) == LOW) {
+        if (deviceConnected) {
+          float diffB = freqB_smooth - offsetB;
+          float diffT = freqT_smooth - offsetT;
+          sendPacketToPhone(diffB, diffT, latestDelta, "Captured");
+        }
+        while (digitalRead(CALIBRATION_BTN) == LOW) { delay(10); }
+        delay(100); 
+      }
+    }
+
+    // التقاط قراءة زر الشاشة التفاعلي بالآيفون
+    if (triggerCaptureFlag) {
+      triggerCaptureFlag = false;
+      if (deviceConnected) {
+        float diffB = freqB_smooth - offsetB;
+        float diffT = freqT_smooth - offsetT;
+        sendPacketToPhone(diffB, diffT, latestDelta, "Captured");
+      }
+    }
+  }
+}
+
+void sendPacketToPhone(float b, float t, float d, String info) {
+  if (deviceConnected && pCharacteristic != NULL) {
+    char txBuffer[90];
+    sprintf(txBuffer, "B:%.1f|T:%.1f|Delta:%.1f|Info:%s\n", b, t, d, info.c_str());
+    pCharacteristic->setValue(txBuffer);
+    pCharacteristic->notify();
+  }
+}
+
+// تصفير ومعايرة طيفية تأخذ متوسط 25 قراءة متتالية لضمان استقرار خط موازنة الأرض في الحقل
+void performMultiSampleCalibration() {
+  float sumB = 0;
+  float sumT = 0;
+  int samples = 25;
+  
+  for (int i = 0; i < samples; i++) {
+    int16_t rawB, rawT;
+    pcnt_get_counter_value(PCNT_UNIT_0, &rawB);
+    pcnt_get_counter_value(PCNT_UNIT_1, &rawT);
+    pcnt_counter_clear(PCNT_UNIT_0);
+    pcnt_counter_clear(PCNT_UNIT_1);
+    
+    sumB += (float)rawB * 10.0f;
+    sumT += (float)rawT * 10.0f;
+    delay(40); 
+  }
+  
+  offsetB = sumB / (float)samples;
+  offsetT = sumT / (float)samples;
+  
+  freqB_smooth = offsetB;
+  freqT_smooth = offsetT;
+  latestDelta = 0.0f;
+}
